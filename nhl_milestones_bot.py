@@ -66,50 +66,71 @@ def get_career_stat(player_id: int, metric_type: str) -> dict:
 
 def coach_games_paul_maurice() -> int | None:
     """
-    Вернёт число игр в РС (regular season) у Пола Мориса.
-    1) Пытаемся взять из REST stats: /stats/rest/en/coach... с разными именами полей.
-    2) Фоллбэк: парсим страницу рекордов (records.nhl.com) и вытаскиваем число рядом с его именем.
+    Возвращает число матчей регулярки у Пола Мориса.
+    1) Пробуем разные варианты REST-запросов к api.nhle.com.
+    2) Фоллбэк: парсим публичную страницу рекордов (regex, без bs4).
     """
+    from urllib.parse import quote
     import re
 
-    # 1) Пытаемся разные варианты REST-поля для имени тренера
-    name_filters = [
-        'coachFullName=%22Paul%20Maurice%22',
-        'fullName=%22Paul%20Maurice%22',
-        'coachName=%22Paul%20Maurice%22',
-        'firstName=%22Paul%22%20and%20lastName=%22Maurice%22',
+    # 1) REST: разные поля имени + aggregate/non-aggregate
+    name_expressions = [
+        'coachFullName="Paul Maurice"',
+        'fullName="Paul Maurice"',
+        'coachName="Paul Maurice"',
+        'firstName="Paul" and lastName="Maurice"',
     ]
-    paths = ['coach/summary', 'coach']  # в некоторых ревизиях работает summary, в некоторых — корневой список
-    for path in paths:
-        for nf in name_filters:
+    for aggregate in (True, False):
+        for expr in name_expressions:
             try:
-                url = f'https://api.nhle.com/stats/rest/en/{path}?isAggregate=true&isGame=false&cayenneExp={nf}'
+                exp = quote(expr, safe='')
+                url = (
+                    "https://api.nhle.com/stats/rest/en/coach/summary"
+                    f"?isAggregate={'true' if aggregate else 'false'}&isGame=false&cayenneExp={exp}"
+                )
                 r = SESSION.get(url, timeout=20)
                 if r.status_code != 200:
                     continue
-                data = (r.json().get('data') or [])
+                data = r.json().get("data") or []
                 if not data:
                     continue
-                row = data[0]
-                # возможные названия поля с играми у тренеров:
-                for key in ('gamesCoached', 'games', 'g', 'gamesPlayed'):
-                    if key in row and isinstance(row[key], (int, float)):
-                        val = int(row[key])
-                        if 500 < val < 3000:
-                            return val
+
+                if aggregate:
+                    row = data[0]
+                    for k in ("gamesCoached", "games", "g"):
+                        v = row.get(k)
+                        try:
+                            v = int(v)
+                        except Exception:
+                            v = None
+                        if isinstance(v, int) and 500 < v < 3000:
+                            return v
+                else:
+                    total = 0
+                    for row in data:
+                        got = None
+                        for k in ("g", "games", "gamesCoached"):
+                            if row.get(k) is not None:
+                                try:
+                                    got = int(row[k])
+                                    break
+                                except Exception:
+                                    pass
+                        if got:
+                            total += got
+                    if 500 < total < 3000:
+                        return total
             except Exception:
                 continue
 
-    # 2) Фоллбэк: тянем со страницы рекордов «Most Games, Career»
-    # там список, где рядом с именем тренера идёт число матчей регулярки.
+    # 2) Фоллбэк: страница рекордов — Most Games, Career (regular season)
     try:
         url = "https://records.nhl.com/records/coach-records/season-and-games/coach-most-games-career"
         r = SESSION.get(url, timeout=20)
         if r.status_code == 200 and r.text:
-            # Упростим пробелы и поищем «Paul Maurice ... ЧИСЛО»
-            text = re.sub(r'\s+', ' ', r.text)
-            # Захватываем число из 3–4 цифр после имени (фильтруем даты типа 1995-96)
-            m = re.search(r'Paul Maurice[^0-9]{0,80}([12][0-9]{2,3})(?![-0-9])', text)
+            text = re.sub(r"\s+", " ", r.text)
+            # Берём число (3–4 цифры) рядом с именем; избегаем попадания в годы формата 1995-96
+            m = re.search(r'Paul Maurice[^0-9]{0,80}([1-2]\d{2,3})(?![-\d])', text)
             if m:
                 val = int(m.group(1))
                 if 500 < val < 3000:
