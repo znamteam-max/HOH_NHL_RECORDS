@@ -65,19 +65,58 @@ def get_career_stat(player_id: int, metric_type: str) -> dict:
         return {}
 
 def coach_games_paul_maurice() -> int | None:
-    url = ("https://api.nhle.com/stats/rest/en/coach/summary"
-           "?isAggregate=true&isGame=false&cayenneExp=fullName=%22Paul%20Maurice%22")
+    """
+    Вернёт число игр в РС (regular season) у Пола Мориса.
+    1) Пытаемся взять из REST stats: /stats/rest/en/coach... с разными именами полей.
+    2) Фоллбэк: парсим страницу рекордов (records.nhl.com) и вытаскиваем число рядом с его именем.
+    """
+    import re
+
+    # 1) Пытаемся разные варианты REST-поля для имени тренера
+    name_filters = [
+        'coachFullName=%22Paul%20Maurice%22',
+        'fullName=%22Paul%20Maurice%22',
+        'coachName=%22Paul%20Maurice%22',
+        'firstName=%22Paul%22%20and%20lastName=%22Maurice%22',
+    ]
+    paths = ['coach/summary', 'coach']  # в некоторых ревизиях работает summary, в некоторых — корневой список
+    for path in paths:
+        for nf in name_filters:
+            try:
+                url = f'https://api.nhle.com/stats/rest/en/{path}?isAggregate=true&isGame=false&cayenneExp={nf}'
+                r = SESSION.get(url, timeout=20)
+                if r.status_code != 200:
+                    continue
+                data = (r.json().get('data') or [])
+                if not data:
+                    continue
+                row = data[0]
+                # возможные названия поля с играми у тренеров:
+                for key in ('gamesCoached', 'games', 'g', 'gamesPlayed'):
+                    if key in row and isinstance(row[key], (int, float)):
+                        val = int(row[key])
+                        if 500 < val < 3000:
+                            return val
+            except Exception:
+                continue
+
+    # 2) Фоллбэк: тянем со страницы рекордов «Most Games, Career»
+    # там список, где рядом с именем тренера идёт число матчей регулярки.
     try:
-        r = SESSION.get(url, timeout=25)
-        if r.status_code != 200:
-            return None
-        rows = r.json().get("data") or []
-        if not rows: return None
-        for k in ("gamesCoached","g","games"):
-            if k in rows[0]:
-                return int(rows[0][k])
+        url = "https://records.nhl.com/records/coach-records/season-and-games/coach-most-games-career"
+        r = SESSION.get(url, timeout=20)
+        if r.status_code == 200 and r.text:
+            # Упростим пробелы и поищем «Paul Maurice ... ЧИСЛО»
+            text = re.sub(r'\s+', ' ', r.text)
+            # Захватываем число из 3–4 цифр после имени (фильтруем даты типа 1995-96)
+            m = re.search(r'Paul Maurice[^0-9]{0,80}([12][0-9]{2,3})(?![-0-9])', text)
+            if m:
+                val = int(m.group(1))
+                if 500 < val < 3000:
+                    return val
     except Exception:
-        return None
+        pass
+
     return None
 
 def fmt_line(name: str, current: int, target: int, metric_ru: str) -> str:
