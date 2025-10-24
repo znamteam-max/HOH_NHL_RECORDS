@@ -8,21 +8,24 @@ from html import escape
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
+# Кого и к какой вехе ведём
 TRACK = [
     {"name":"Никита Кучеров","id":8476453,"type":"points","target":1000},
     {"name":"Брэд Маршан","id":8473419,"type":"points","target":1000},
     {"name":"Джейми Бэнн","id":8473994,"type":"points","target":1000},
     {"name":"Леон Драйзайтль","id":8477934,"type":"points","target":1000},
+
     {"name":"Александр Овечкин","id":8471214,"type":"games","target":1500},
     {"name":"Александр Овечкин","id":8471214,"type":"goals","target":900},
+
     {"name":"Джон Таварес","id":8475166,"type":"goals","target":500},
     {"name":"Патрик Кейн","id":8474141,"type":"goals","target":500},
+
     {"name":"Андрей Василевский","id":8476883,"type":"wins","target":350},
     {"name":"Сергей Бобровский","id":8475683,"type":"wins","target":450},
+
     {"name":"Стивен Стэмкос","id":8474564,"type":"goals","target":600},
 ]
-
-COACH = {"name": "Пол Морис", "target": 2000}
 
 def make_session():
     s = requests.Session()
@@ -33,15 +36,21 @@ def make_session():
         raise_on_status=False
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({"User-Agent": "NHL-MilestonesBot/REST-only/1.0"})
+    s.headers.update({"User-Agent": "NHL-MilestonesBot/REST-only/1.2"})
     return s
 
 SESSION = make_session()
 
+# ---------- Totals (career regular season) from api.nhle.com ----------
+
 def rest_skater_totals(player_id: int) -> dict:
-    url = ("https://api.nhle.com/stats/rest/en/skater/summary"
-           f"?isAggregate=true&isGame=false&cayenneExp=playerId={player_id}%20and%20gameTypeId=2")
-    r = SESSION.get(url, timeout=25); r.raise_for_status()
+    url = ("https://api.nhle.com/stats/rest/en/skater/summary")
+    params = {
+        "isAggregate": "true",
+        "isGame": "false",
+        "cayenneExp": f"playerId={player_id} and gameTypeId=2"
+    }
+    r = SESSION.get(url, params=params, timeout=25); r.raise_for_status()
     row = (r.json().get("data") or [{}])[0]
     return {
         "games": int(row.get("gamesPlayed") or row.get("gp") or 0),
@@ -51,12 +60,18 @@ def rest_skater_totals(player_id: int) -> dict:
     }
 
 def rest_goalie_totals(player_id: int) -> dict:
-    url = ("https://api.nhle.com/stats/rest/en/goalie/summary"
-           f"?isAggregate=true&isGame=false&cayenneExp=playerId={player_id}%20and%20gameTypeId=2")
-    r = SESSION.get(url, timeout=25); r.raise_for_status()
+    url = ("https://api.nhle.com/stats/rest/en/goalie/summary")
+    params = {
+        "isAggregate": "true",
+        "isGame": "false",
+        "cayenneExp": f"playerId={player_id} and gameTypeId=2"
+    }
+    r = SESSION.get(url, params=params, timeout=25); r.raise_for_status()
     row = (r.json().get("data") or [{}])[0]
-    return {"games": int(row.get("gamesPlayed") or row.get("gp") or 0),
-            "wins": int(row.get("wins") or row.get("w") or 0)}
+    return {
+        "games": int(row.get("gamesPlayed") or row.get("gp") or 0),
+        "wins": int(row.get("wins") or row.get("w") or 0),
+    }
 
 def get_career_stat(player_id: int, metric_type: str) -> dict:
     try:
@@ -64,89 +79,91 @@ def get_career_stat(player_id: int, metric_type: str) -> dict:
     except Exception:
         return {}
 
-def coach_games_paul_maurice() -> int | None:
-    """
-    Возвращает число матчей регулярки у Пола Мориса.
-    1) Пробуем разные варианты REST-запросов к api.nhle.com.
-    2) Фоллбэк: парсим публичную страницу рекордов (regex, без bs4).
-    """
-    from urllib.parse import quote
-    import re
+# ---------- Last game delta (+N) from api.nhle.com ----------
 
-    # 1) REST: разные поля имени + aggregate/non-aggregate
-    name_expressions = [
-        'coachFullName="Paul Maurice"',
-        'fullName="Paul Maurice"',
-        'coachName="Paul Maurice"',
-        'firstName="Paul" and lastName="Maurice"',
-    ]
-    for aggregate in (True, False):
-        for expr in name_expressions:
-            try:
-                exp = quote(expr, safe='')
-                url = (
-                    "https://api.nhle.com/stats/rest/en/coach/summary"
-                    f"?isAggregate={'true' if aggregate else 'false'}&isGame=false&cayenneExp={exp}"
-                )
-                r = SESSION.get(url, timeout=20)
-                if r.status_code != 200:
-                    continue
-                data = r.json().get("data") or []
-                if not data:
-                    continue
-
-                if aggregate:
-                    row = data[0]
-                    for k in ("gamesCoached", "games", "g"):
-                        v = row.get(k)
-                        try:
-                            v = int(v)
-                        except Exception:
-                            v = None
-                        if isinstance(v, int) and 500 < v < 3000:
-                            return v
-                else:
-                    total = 0
-                    for row in data:
-                        got = None
-                        for k in ("g", "games", "gamesCoached"):
-                            if row.get(k) is not None:
-                                try:
-                                    got = int(row[k])
-                                    break
-                                except Exception:
-                                    pass
-                        if got:
-                            total += got
-                    if 500 < total < 3000:
-                        return total
-            except Exception:
-                continue
-
-    # 2) Фоллбэк: страница рекордов — Most Games, Career (regular season)
+def _get_json(url: str, params: dict) -> dict:
+    r = SESSION.get(url, params=params, timeout=25)
+    if r.status_code != 200:
+        return {}
     try:
-        url = "https://records.nhl.com/records/coach-records/season-and-games/coach-most-games-career"
-        r = SESSION.get(url, timeout=20)
-        if r.status_code == 200 and r.text:
-            text = re.sub(r"\s+", " ", r.text)
-            # Берём число (3–4 цифры) рядом с именем; избегаем попадания в годы формата 1995-96
-            m = re.search(r'Paul Maurice[^0-9]{0,80}([1-2]\d{2,3})(?![-\d])', text)
-            if m:
-                val = int(m.group(1))
-                if 500 < val < 3000:
-                    return val
+        return r.json()
+    except Exception:
+        return {}
+
+def skater_last_game_row(player_id: int) -> dict | None:
+    url = "https://api.nhle.com/stats/rest/en/skater/summary"
+    params = {
+        "isAggregate": "false",
+        "isGame": "true",
+        "cayenneExp": f"playerId={player_id} and gameTypeId=2",
+        # сортируем по дате игры убыв., берём 1 запись
+        "sort": '[{"property":"gameDate","direction":"DESC"}]',
+        "limit": "1"
+    }
+    j = _get_json(url, params)
+    rows = j.get("data") or []
+    return rows[0] if rows else None
+
+def goalie_last_game_row(player_id: int) -> dict | None:
+    url = "https://api.nhle.com/stats/rest/en/goalie/summary"
+    params = {
+        "isAggregate": "false",
+        "isGame": "true",
+        "cayenneExp": f"playerId={player_id} and gameTypeId=2",
+        "sort": '[{"property":"gameDate","direction":"DESC"}]',
+        "limit": "1"
+    }
+    j = _get_json(url, params)
+    rows = j.get("data") or []
+    return rows[0] if rows else None
+
+def _get_int(row: dict, keys: tuple[str,...], default: int = 0) -> int:
+    for k in keys:
+        v = row.get(k)
+        try:
+            return int(v)
+        except Exception:
+            pass
+    return default
+
+def last_game_delta(player_id: int, metric_type: str) -> int:
+    """Возвращает +N для строки: сколько добавил в ПОСЛЕДНЕМ матче по целевой метрике."""
+    try:
+        if metric_type == "wins":
+            row = goalie_last_game_row(player_id)
+            if not row:
+                return 0
+            # Победа?
+            decision = (row.get("decision") or row.get("gameOutcome") or "").strip().upper()
+            return 1 if decision == "W" else 0
+
+        # Скатеры
+        row = skater_last_game_row(player_id)
+        if not row:
+            return 0
+        if metric_type == "goals":
+            return _get_int(row, ("goals", "g"), 0)
+        if metric_type == "points":
+            g = _get_int(row, ("goals", "g"), 0)
+            a = _get_int(row, ("assists", "a"), 0)
+            return g + a
+        if metric_type == "games":
+            # если есть запись о матче — значит играл
+            return 1
     except Exception:
         pass
+    return 0
 
-    return None
+# ---------- Presentation ----------
 
-def fmt_line(name: str, current: int, target: int, metric_ru: str) -> str:
+def fmt_line(name: str, current: int, target: int, metric_ru: str, delta: int) -> str:
     left = max(target - current, 0)
     status = "✅" if left == 0 else ("🔥" if left <= 10 else "🧊")
     total = max(target, current) or 1
     filled = 10 if left == 0 else max(1, round(10 * current / total))
     bar = "█" * filled + "░" * (10 - filled)
-    return f"<b>{escape(name)}</b> — {current} {metric_ru} · осталось {left}\n{bar} {status}"
+    # Добавляем (+N) после "осталось"
+    return f"<b>{escape(name)}</b> — {current} {metric_ru} · осталось {left} (+{delta})\n{bar} {status}"
 
 def build_message() -> str:
     today = dt.datetime.now(tz=ZoneInfo("Europe/London")).strftime("%d %b %Y")
@@ -154,13 +171,9 @@ def build_message() -> str:
     for it in TRACK:
         stat = get_career_stat(it["id"], it["type"])
         current = int(stat.get(it["type"], 0))
+        delta = last_game_delta(it["id"], it["type"])
         metric_ru = {"points":"очк.","goals":"гол.","games":"матч.","wins":"побед"}[it["type"]]
-        lines.append(fmt_line(it["name"], current, it["target"], metric_ru))
-    g = coach_games_paul_maurice()
-    if g is not None:
-        lines.append(fmt_line("Пол Морис", g, COACH["target"], "матч."))
-    else:
-        lines.append("<b>Пол Морис</b> — источник недоступен.")
+        lines.append(fmt_line(it["name"], current, it["target"], metric_ru, delta))
     lines += ["", "ℹ️ Источник данных: api.nhle.com (REST). Обновление раз в сутки."]
     return "\n".join(lines)
 
@@ -181,5 +194,4 @@ if __name__ == "__main__":
         send_telegram(msg)
         print("OK")
     except Exception as e:
-        print("ERROR:", repr(e), file=sys.stderr)
-        sys.exit(1)
+        print("ERROR:", repr(e),
