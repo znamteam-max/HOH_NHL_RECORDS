@@ -1,15 +1,13 @@
-import os, sys, json, time, datetime as dt
+import os, sys, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
-from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from html import escape
 
-# --- Настройки окружения (Telegram) ---
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- Игроки и цели ---
-# type: one of ["points","goals","games","wins"]
 TRACK = [
     {"name":"Никита Кучеров","id":8476453,"type":"points","target":1000},
     {"name":"Брэд Маршан","id":8473419,"type":"points","target":1000},
@@ -24,167 +22,98 @@ TRACK = [
     {"name":"Стивен Стэмкос","id":8474564,"type":"goals","target":600},
 ]
 
-COACH = {
-    "name": "Пол Морис",
-    "target": 2000,
-    # первичный источник для парсинга, если REST не даст
-    "records_page": "https://records.nhl.com/coaches/paul-maurice-73"
-}
+COACH = {"name": "Пол Морис", "target": 2000}
 
-# --- helpers ---
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "MilestonesBot/1.0 (+github actions)"})
+def make_session():
+    s = requests.Session()
+    retries = Retry(
+        total=6, connect=6, read=6, backoff_factor=0.7,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET","POST"],
+        raise_on_status=False
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.headers.update({"User-Agent": "NHL-MilestonesBot/REST-only/1.0"})
+    return s
 
+SESSION = make_session()
 
-def get_career_stat(person_id: int) -> dict:
-    """Возвращает карьерные тоталы с учётом текущего сезона."""
-    url = f"https://statsapi.web.nhl.com/api/v1/people/{person_id}?expand=person.stats&stats=careerRegularSeason"
-    r = SESSION.get(url, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-    try:
-        stat = data["people"][0]["stats"][0]["splits"][0]["stat"]
-    except Exception:
-        return {}
-    # нормализуем доступные поля
+def rest_skater_totals(player_id: int) -> dict:
+    url = ("https://api.nhle.com/stats/rest/en/skater/summary"
+           f"?isAggregate=true&isGame=false&cayenneExp=playerId={player_id}%20and%20gameTypeId=2")
+    r = SESSION.get(url, timeout=25); r.raise_for_status()
+    row = (r.json().get("data") or [{}])[0]
     return {
-        "games": int(stat.get("games", 0)),
-        "goals": int(stat.get("goals", 0)),
-        "assists": int(stat.get("assists", 0)),
-        "points": int(stat.get("points", 0)),
-        "wins": int(stat.get("wins", 0)),  # для вратарей
-        # на будущее: "losses", "ot", "savePercentage" и т.п.
+        "games": int(row.get("gamesPlayed") or row.get("gp") or 0),
+        "goals": int(row.get("goals") or 0),
+        "assists": int(row.get("assists") or 0),
+        "points": int(row.get("points") or 0),
     }
 
+def rest_goalie_totals(player_id: int) -> dict:
+    url = ("https://api.nhle.com/stats/rest/en/goalie/summary"
+           f"?isAggregate=true&isGame=false&cayenneExp=playerId={player_id}%20and%20gameTypeId=2")
+    r = SESSION.get(url, timeout=25); r.raise_for_status()
+    row = (r.json().get("data") or [{}])[0]
+    return {"games": int(row.get("gamesPlayed") or row.get("gp") or 0),
+            "wins": int(row.get("wins") or row.get("w") or 0)}
 
-def try_coach_rest_fullname(fullname: str) -> int | None:
-    """Пробуем найти игры тренера через REST stats (недокументировано, но часто работает)."""
-    endpoints = [
-        f"https://api.nhle.com/stats/rest/en/coach/summary?isAggregate=true&isGame=false&cayenneExp=fullName=%22{requests.utils.quote(fullname)}%22",
-        f"https://api.nhle.com/stats/rest/en/coach/summary?isAggregate=false&isGame=false&cayenneExp=fullName=%22{requests.utils.quote(fullname)}%22",
-        f"https://api.nhle.com/stats/rest/en/coach/summary?cayenneExp=coachName=%22{requests.utils.quote(fullname)}%22",
-    ]
-    for url in endpoints:
-        try:
-            r = SESSION.get(url, timeout=25)
-            if r.status_code != 200:
-                continue
-            j = r.json()
-            rows = j.get("data") or j.get("rows") or []
-            if not rows:
-                continue
-            # В агрегате обычно есть field gamesCoached или g (в зависимости от отчёта)
-            keys = ["gamesCoached", "g", "games"]
-            for k in keys:
-                if k in rows[0]:
-                    val = rows[0][k]
-                    try:
-                        return int(val)
-                    except Exception:
-                        pass
-        except Exception:
-            continue
-    return None
+def get_career_stat(player_id: int, metric_type: str) -> dict:
+    try:
+        return rest_goalie_totals(player_id) if metric_type == "wins" else rest_skater_totals(player_id)
+    except Exception:
+        return {}
 
-
-def scrape_maurice_records_page(url: str) -> int | None:
-    """Парсим официальную страницу рекордов НХЛ по Полу Морису и вытаскиваем total Games (регулярка)."""
+def coach_games_paul_maurice() -> int | None:
+    url = ("https://api.nhle.com/stats/rest/en/coach/summary"
+           "?isAggregate=true&isGame=false&cayenneExp=fullName=%22Paul%20Maurice%22")
     try:
         r = SESSION.get(url, timeout=25)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        # Ищем таблицу Regular Season и строку Totals
-        # Подстраиваемся под разметку: ищем все таблицы и строку, где есть 'Totals'/'Total' и столбец 'G'
-        tables = soup.find_all("table")
-        best_guess = None
-        for tbl in tables:
-            head = [th.get_text(strip=True) for th in tbl.find_all("th")]
-            if not head:
-                continue
-            if "G" in head or "GP" in head:
-                for tr in tbl.find_all("tr"):
-                    cells = [td.get_text(strip=True) for td in tr.find_all(["td","th"])]
-                    row_text = " ".join(cells).lower()
-                    if "total" in row_text or "totals" in row_text:
-                        # найдём индекс колонки игр
-                        col = None
-                        for key in ("G","GP","Games"):
-                            if key in head:
-                                col = head.index(key)
-                                break
-                        if col is not None and len(cells) > col:
-                            # иногда в Totals идёт несколько подсекций; берём число
-                            val = "".join([c for c in cells[col] if c.isdigit()])
-                            if val:
-                                best_guess = int(val)
-        return best_guess
+        if r.status_code != 200:
+            return None
+        rows = r.json().get("data") or []
+        if not rows: return None
+        for k in ("gamesCoached","g","games"):
+            if k in rows[0]:
+                return int(rows[0][k])
     except Exception:
         return None
-
-
-def get_coach_games_current() -> int | None:
-    # 1) сначала пробуем REST по имени
-    n = try_coach_rest_fullname("Paul Maurice")
-    if isinstance(n, int) and n > 0:
-        return n
-    # 2) бэкап — парсим records.nhl.com
-    return scrape_maurice_records_page(COACH["records_page"])
-
+    return None
 
 def fmt_line(name: str, current: int, target: int, metric_ru: str) -> str:
     left = max(target - current, 0)
-    status_emoji = "✅" if left == 0 else ("🔥" if left <= 10 else "🧊")
-    # мини-прогресс-бар на 10 делений
-    total = max(target, current)
+    status = "✅" if left == 0 else ("🔥" if left <= 10 else "🧊")
+    total = max(target, current) or 1
     filled = 10 if left == 0 else max(1, round(10 * current / total))
     bar = "█" * filled + "░" * (10 - filled)
-    return f"<b>{escape(name)}</b> — {current} {metric_ru} · осталось {left}\n{bar} {status_emoji}"
-
+    return f"<b>{escape(name)}</b> — {current} {metric_ru} · осталось {left}\n{bar} {status}"
 
 def build_message() -> str:
-    london = ZoneInfo("Europe/London")
-    today = dt.datetime.now(tz=london).strftime("%d %b %Y")
-    lines = [f"<b>НХЛ · Утреннее обновление по вехам</b>  — {today}", ""]
-
-    # Игроки/вратари
-    for item in TRACK:
-        stat = get_career_stat(item["id"])
-        metric = item["type"]
-        current = int(stat.get(metric, 0))
-        metric_ru = {
-            "points":"очк.",
-            "goals":"гол.",
-            "games":"матч.",
-            "wins":"побед"
-        }[metric]
-        lines.append(fmt_line(item["name"], current, item["target"], metric_ru))
-
-    # Тренер
-    coach_games = get_coach_games_current()
-    if coach_games:
-        lines.append(fmt_line(COACH["name"], int(coach_games), COACH["target"], "матч."))  # матчи как метрика
+    today = dt.datetime.now(tz=ZoneInfo("Europe/London")).strftime("%d %b %Y")
+    lines = [f"<b>НХЛ · Утреннее обновление по вехам</b> — {today}", ""]
+    for it in TRACK:
+        stat = get_career_stat(it["id"], it["type"])
+        current = int(stat.get(it["type"], 0))
+        metric_ru = {"points":"очк.","goals":"гол.","games":"матч.","wins":"побед"}[it["type"]]
+        lines.append(fmt_line(it["name"], current, it["target"], metric_ru))
+    g = coach_games_paul_maurice()
+    if g is not None:
+        lines.append(fmt_line("Пол Морис", g, COACH["target"], "матч."))
     else:
-        lines.append(f"<b>{escape(COACH['name'])}</b> — не удалось получить текущее число матчей (источник недоступен).")
-
-    lines.append("")
-    lines.append("ℹ️ Данные: официальные публичные NHL API/страницы. Обновляется раз в сутки.")
+        lines.append("<b>Пол Морис</b> — источник недоступен.")
+    lines += ["", "ℹ️ Источник данных: api.nhle.com (REST). Обновление раз в сутки."]
     return "\n".join(lines)
-
 
 def send_telegram(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         print("No TELEGRAM_BOT_TOKEN/CHAT_ID in env", file=sys.stderr)
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    r = SESSION.post(url, json=payload, timeout=25)
+    r = SESSION.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+        timeout=25
+    )
     r.raise_for_status()
-
 
 if __name__ == "__main__":
     try:
@@ -192,6 +121,5 @@ if __name__ == "__main__":
         send_telegram(msg)
         print("OK")
     except Exception as e:
-        # чтобы Action не падал навсегда — логируем и выходим с ошибкой
         print("ERROR:", repr(e), file=sys.stderr)
         sys.exit(1)
