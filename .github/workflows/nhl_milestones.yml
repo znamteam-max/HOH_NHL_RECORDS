@@ -1,9 +1,9 @@
 name: NHL milestones to Telegram
 
 on:
-  schedule:
-    - cron: "35 5 * * *"   # 06:35 Europe/London (cron в UTC)
   workflow_dispatch:
+  schedule:
+    - cron: "35 5 * * *"   # 06:35 Europe/London (UTC cron)
 
 jobs:
   run:
@@ -20,7 +20,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      # Перезаписываем скрипт на REST-only версию (без statsapi.web.nhl.com)
+      # Перезаписываем скрипт на REST-only версию (никакого statsapi.web.nhl.com)
       - name: Write REST-only bot script
         run: |
           cat > nhl_milestones_bot.py <<'PY'
@@ -108,7 +108,7 @@ jobs:
 
           def fmt_line(name: str, current: int, target: int, metric_ru: str) -> str:
               left = max(target - current, 0)
-              status = "✅" if left == 0 else ("🔥" if left <= 10 else "🧊")
+              status = "OK" if left == 0 else ("SOON" if left <= 10 else "...")
               total = max(target, current) or 1
               filled = 10 if left == 0 else max(1, round(10 * current / total))
               bar = "█" * filled + "░" * (10 - filled)
@@ -155,7 +155,7 @@ jobs:
       - name: Guard: forbid statsapi usage
         run: |
           if grep -R "statsapi.web.nhl.com" -n || grep -R "statsapi" -n ; then
-            echo "❌ Found statsapi usage in repo. Update failed."
+            echo "Found statsapi usage in repo. Update failed."
             exit 1
           fi
 
