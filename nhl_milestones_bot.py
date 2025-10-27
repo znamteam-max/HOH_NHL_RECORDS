@@ -13,6 +13,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ====== Слежение за вехами (метрики: points | goals | games | wins) ======
 # Убраны: Кучеров→1000 очков, Овечкин→1500 матчей
+# Добавлены: Джейми Бэнн → 400 голов, Коннор Хеллебак → 350 побед
 TRACK = [
     {"name": "Брэд Маршан",        "id": 8473419, "type": "points", "target": 1000},
     {"name": "Джейми Бэнн",        "id": 8473994, "type": "points", "target": 1000},
@@ -22,11 +23,11 @@ TRACK = [
 
     {"name": "Джон Таварес",       "id": 8475166, "type": "goals",  "target": 500},
     {"name": "Патрик Кейн",        "id": 8474141, "type": "goals",  "target": 500},
-    {"name": "Джейми Бэнн",        "id": 8473994, "type": "goals",  "target": 400},  # ДОБАВЛЕНО
+    {"name": "Джейми Бэнн",        "id": 8473994, "type": "goals",  "target": 400},  # NEW
 
     {"name": "Андрей Василевский", "id": 8476883, "type": "wins",   "target": 350},
     {"name": "Сергей Бобровский",  "id": 8475683, "type": "wins",   "target": 450},
-    {"name": "Коннор Хеллебак",    "id": 8476945, "type": "wins",   "target": 350},  # ДОБАВЛЕНО
+    {"name": "Коннор Хеллебак",    "id": 8476945, "type": "wins",   "target": 350},  # NEW
 
     {"name": "Стивен Стэмкос",     "id": 8474564, "type": "goals",  "target": 600},
 ]
@@ -42,21 +43,29 @@ def make_session() -> requests.Session:
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({"User-Agent": "NHL-MilestonesBot/REST-only/1.3"})
+    s.headers.update({"User-Agent": "NHL-MilestonesBot/REST-only/1.4"})
     return s
 
 SESSION = make_session()
 
+# ====== Вспомогательная дата: "вчера по американскому времени (ET)" ======
+def target_us_date() -> dt.date:
+    """
+    Целевая дата = 'вчера' по America/New_York (ET).
+    """
+    now_us = dt.datetime.now(tz=ZoneInfo("America/New_York"))
+    return (now_us - dt.timedelta(days=1)).date()
+
+def target_us_date_str() -> str:
+    return target_us_date().isoformat()  # YYYY-MM-DD
+
 # ====== Тоталы карьеры (регулярка) из api.nhle.com ======
 def rest_skater_totals(player_id: int) -> dict:
-    """
-    Возвращает карьерные тоталы (регулярка) для полевого игрока.
-    """
     url = "https://api.nhle.com/stats/rest/en/skater/summary"
     params = {
         "isAggregate": "true",
         "isGame": "false",
-        "cayenneExp": f"playerId={player_id} and gameTypeId=2",
+        "cayenneExp": f'playerId={player_id} and gameTypeId=2',
     }
     r = SESSION.get(url, params=params, timeout=25)
     r.raise_for_status()
@@ -69,14 +78,11 @@ def rest_skater_totals(player_id: int) -> dict:
     }
 
 def rest_goalie_totals(player_id: int) -> dict:
-    """
-    Возвращает карьерные тоталы (регулярка) для вратаря.
-    """
     url = "https://api.nhle.com/stats/rest/en/goalie/summary"
     params = {
         "isAggregate": "true",
         "isGame": "false",
-        "cayenneExp": f"playerId={player_id} and gameTypeId=2",
+        "cayenneExp": f'playerId={player_id} and gameTypeId=2',
     }
     r = SESSION.get(url, params=params, timeout=25)
     r.raise_for_status()
@@ -87,9 +93,6 @@ def rest_goalie_totals(player_id: int) -> dict:
     }
 
 def get_career_stat(player_id: int, metric_type: str) -> dict:
-    """
-    Унифицированный доступ к тоталам по нужной метрике.
-    """
     try:
         if metric_type == "wins":
             return rest_goalie_totals(player_id)
@@ -97,7 +100,7 @@ def get_career_stat(player_id: int, metric_type: str) -> dict:
     except Exception:
         return {}
 
-# ====== Данные по последнему матчу и "играл ли сегодня" ======
+# ====== Данные ИМЕННО за целевую дату (ET) ======
 def _get_json(url: str, params: dict) -> dict:
     try:
         r = SESSION.get(url, params=params, timeout=25)
@@ -107,32 +110,33 @@ def _get_json(url: str, params: dict) -> dict:
     except Exception:
         return {}
 
-def skater_last_game_row(player_id: int) -> dict | None:
+def skater_game_row_on_date(player_id: int, ymd: str) -> dict | None:
     """
-    Последний сыгранный матч (регулярка) для полевого игрока.
+    Строка статистики полевого игрока за конкретную дату (ET).
     """
     url = "https://api.nhle.com/stats/rest/en/skater/summary"
+    # В cayenneExp строки должны быть в кавычках
+    exp = f'playerId={player_id} and gameTypeId=2 and gameDate="{ymd}"'
     params = {
         "isAggregate": "false",
         "isGame": "true",
-        "cayenneExp": f"playerId={player_id} and gameTypeId=2",
-        "sort": '[{"property":"gameDate","direction":"DESC"}]',
+        "cayenneExp": exp,
         "limit": "1",
     }
     j = _get_json(url, params)
     rows = j.get("data") or []
     return rows[0] if rows else None
 
-def goalie_last_game_row(player_id: int) -> dict | None:
+def goalie_game_row_on_date(player_id: int, ymd: str) -> dict | None:
     """
-    Последний сыгранный матч (регулярка) для вратаря.
+    Строка статистики вратаря за конкретную дату (ET).
     """
     url = "https://api.nhle.com/stats/rest/en/goalie/summary"
+    exp = f'playerId={player_id} and gameTypeId=2 and gameDate="{ymd}"'
     params = {
         "isAggregate": "false",
         "isGame": "true",
-        "cayenneExp": f"playerId={player_id} and gameTypeId=2",
-        "sort": '[{"property":"gameDate","direction":"DESC"}]',
+        "cayenneExp": exp,
         "limit": "1",
     }
     j = _get_json(url, params)
@@ -150,60 +154,41 @@ def _get_int(row: dict, keys: tuple[str, ...], default: int = 0) -> int:
             continue
     return default
 
-def _played_today(row: dict) -> bool:
+def delta_for_us_date(player_id: int, metric_type: str, ymd: str) -> tuple[int, bool]:
     """
-    Определяет, был ли этот матч сегодня по Europe/London.
-    """
-    if not row:
-        return False
-    gd = (row.get("gameDate") or "")[:10]  # 'YYYY-MM-DD...'
-    if len(gd) != 10:
-        return False
-    try:
-        game_date = dt.date.fromisoformat(gd)
-    except Exception:
-        return False
-    today_ldn = dt.datetime.now(tz=ZoneInfo("Europe/London")).date()
-    return game_date == today_ldn
-
-def last_game_delta_and_flag(player_id: int, metric_type: str) -> tuple[int, bool]:
-    """
-    Возвращает (delta, played_today).
-      - points: голы + передачи в последнем матче,
-      - goals: голы в последнем матче,
-      - games: 1 если играл в последнем матче (и этот матч сегодня), иначе 0,
-      - wins: 1 если вратарь победил в последнем выходе, иначе 0.
-    played_today = True, если последний матч именно сегодня (Europe/London).
+    Возвращает (delta, played_on_date) для указанной целевой даты (ET).
+      - points: голы + передачи в матче этой даты,
+      - goals: голы в матче этой даты,
+      - games: 1 если играл в эту дату, иначе 0,
+      - wins: 1 если вратарь победил в эту дату, иначе 0.
+    played_on_date=True, если игрок/вратарь выходил на лёд именно в эту дату (ET).
     """
     try:
         if metric_type == "wins":
-            row = goalie_last_game_row(player_id)
-            played = _played_today(row)
+            row = goalie_game_row_on_date(player_id, ymd)
             if not row:
                 return 0, False
             decision = (row.get("decision") or row.get("gameOutcome") or "").strip().upper()
             if decision == "W":
-                return 1, played
+                return 1, True
             w = _get_int(row, ("wins", "w"), 0)
-            return (1 if w > 0 else 0), played
+            return (1 if w > 0 else 0), True
 
         # Полевые игроки
-        row = skater_last_game_row(player_id)
-        played = _played_today(row)
+        row = skater_game_row_on_date(player_id, ymd)
         if not row:
             return 0, False
 
         if metric_type == "goals":
-            return _get_int(row, ("goals", "g"), 0), played
+            return _get_int(row, ("goals", "g"), 0), True
 
         if metric_type == "points":
             g = _get_int(row, ("goals", "g"), 0)
             a = _get_int(row, ("assists", "a"), 0)
-            return g + a, played
+            return g + a, True
 
         if metric_type == "games":
-            # сам факт наличия строки — игрок сыграл, но нам важно именно "сегодня"
-            return (1 if played else 0), played
+            return 1, True
 
     except Exception:
         pass
@@ -211,25 +196,29 @@ def last_game_delta_and_flag(player_id: int, metric_type: str) -> tuple[int, boo
     return 0, False
 
 # ====== Формирование сообщения ======
-def fmt_line(name: str, current: int, target: int, metric_ru: str, delta: int, played_today: bool) -> str:
+def fmt_line(name: str, current: int, target: int, metric_ru: str, delta: int, played_on_date: bool) -> str:
     left = max(target - current, 0)
     status = "✅" if left == 0 else ("🔥" if left <= 10 else "🧊")
     total = max(target, current) or 1
     filled = 10 if left == 0 else max(1, round(10 * current / total))
     bar = "█" * filled + "░" * (10 - filled)
-    suffix = f"(+{delta})" if played_today else "(=)"
+    suffix = f"(+{delta})" if played_on_date else "(=)"
     return f"<b>{escape(name)}</b> — {current} {metric_ru} · осталось {left} {suffix}\n{bar} {status}"
 
 def build_message() -> str:
-    today = dt.datetime.now(tz=ZoneInfo("Europe/London")).strftime("%d %b %Y")
-    lines = [f"<b>НХЛ · Утреннее обновление по вехам</b> — {today}", ""]
+    london_now = dt.datetime.now(tz=ZoneInfo("Europe/London"))
+    us_ymd = target_us_date()
+    us_ymd_str = us_ymd.strftime("%d %b %Y")
+    header = f"<b>НХЛ · Утреннее обновление по вехам</b> — {london_now.strftime('%d %b %Y')} · отчёт за {us_ymd_str} (ET)"
+
+    lines = [header, ""]
     for it in TRACK:
         stat = get_career_stat(it["id"], it["type"])
         current = int(stat.get(it["type"], 0))
-        delta, played_today = last_game_delta_and_flag(it["id"], it["type"])
+        delta, played = delta_for_us_date(it["id"], it["type"], us_ymd.isoformat())
         metric_ru = {"points": "очк.", "goals": "гол.", "games": "матч.", "wins": "побед"}[it["type"]]
-        lines.append(fmt_line(it["name"], current, it["target"], metric_ru, delta, played_today))
-    lines += ["", "ℹ️ Источник данных: api.nhle.com (REST). Обновление раз в сутки."]
+        lines.append(fmt_line(it["name"], current, it["target"], metric_ru, delta, played))
+    lines += ["", "ℹ️ Источник данных: api.nhle.com (REST). Отчёт за вчера по ET."]
     return "\n".join(lines)
 
 # ====== Отправка в Telegram ======
